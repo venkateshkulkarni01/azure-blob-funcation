@@ -1,68 +1,72 @@
 package com.example;
 
+import com.azure.storage.queue.QueueClient;
+import com.azure.storage.queue.QueueClientBuilder;
+import com.microsoft.azure.functions.annotation.*;
+import com.microsoft.azure.functions.*;
+
 import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.util.Optional;
+import java.util.logging.Logger;
 
-import com.microsoft.azure.functions.ExecutionContext;
-import com.microsoft.azure.functions.HttpMethod;
-import com.microsoft.azure.functions.HttpRequestMessage;
-import com.microsoft.azure.functions.HttpResponseMessage;
-import com.microsoft.azure.functions.HttpStatus;
-import com.microsoft.azure.functions.annotation.AuthorizationLevel;
-import com.microsoft.azure.functions.annotation.FunctionName;
-import com.microsoft.azure.functions.annotation.HttpTrigger;
-
+/**
+ * Azure Function triggered by a new blob in 'input-container'.
+ * It reads the file content, estimates line count, and sends routing info
+ * to one of three Azure Storage Queues based on the file size:
+ *  - file-small-queue: < 50,000 lines
+ *  - file-medium-queue: 50,000–500,000 lines
+ *  - file-large-queue: > 500,000 lines
+ */
 public class FunctionApp {
 
-    @FunctionName("RouteFileBasedOnSize")
-    public HttpResponseMessage run(
-            @HttpTrigger(name = "req", methods = {
-                    HttpMethod.POST }, authLevel = AuthorizationLevel.ANONYMOUS) HttpRequestMessage<Optional<BlobEventRequest>> request,
-            final ExecutionContext context) {
-        context.getLogger().info("[Local Simulation] Function triggered to route file based on line count.");
+    /**
+     * Function method triggered on blob upload to 'input-container'.
+     * Determines file size by line count and routes a message to the correct queue.
+     *
+     * @param content   the file content in bytes
+     * @param fileName  the name of the uploaded file
+     * @param context   function execution context for logging
+     */
+    @FunctionName("RouteBlobFileBySize")
+    public void run(
+        @BlobTrigger(name = "blob", path = "input-container/{name}", dataType = "binary",
+                     connection = "AzureWebJobsStorage") byte[] content,
+        @BindingName("name") String fileName,
+        final ExecutionContext context
+    ) {
+        Logger log = context.getLogger();
+        log.info("[Trigger] Blob file received: " + fileName);
 
-        BlobEventRequest blobRequest = request.getBody()
-                .orElseThrow(() -> new RuntimeException("Invalid request body"));
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new java.io.ByteArrayInputStream(content), StandardCharsets.UTF_8))) {
 
-        String filePath = blobRequest.getBlobUrl();
-        String fileName = new File(filePath).getName();
-
-        try {
-            long lineCount = countLines(filePath);
+            long lineCount = reader.lines().count();
+            log.info("[Info] Line count estimated: " + lineCount);
 
             String queueName;
-            if (lineCount < 50_000)
-                queueName = "file-small-queue";
-            else if (lineCount <= 500_000)
-                queueName = "file-medium-queue";
-            else
-                queueName = "file-large-queue";
+            if (lineCount < 50_000) queueName = "file-small-queue";
+            else if (lineCount <= 500_000) queueName = "file-medium-queue";
+            else queueName = "file-large-queue";
 
-            String queueMessage = String.format("{\"fileName\":\"%s\", \"lineCount\":%d, \"blobUrl\":\"%s\"}", fileName,
-                    lineCount, filePath);
+            String blobUrl = "https://<your-storage-account>.blob.core.windows.net/input-container/" + fileName;
 
-            context.getLogger().info("Simulated Routing -> Would send to: " + queueName);
-            context.getLogger().info("Payload: " + queueMessage);
+            String queueMessage = String.format("{\"fileName\":\"%s\", \"lineCount\":%d, \"blobUrl\":\"%s\"}",
+                    fileName, lineCount, blobUrl);
 
-            return request.createResponseBuilder(HttpStatus.OK)
-                    .body("Simulated routing to queue: " + queueName)
-                    .build();
+            log.info("[Routing] Sending message to: " + queueName);
+            log.info("[Payload] " + queueMessage);
+
+            QueueClient queueClient = new QueueClientBuilder()
+                    .connectionString(System.getenv("AZURE_STORAGE_CONNECTION_STRING"))
+                    .queueName(queueName)
+                    .buildClient();
+
+            queueClient.sendMessage(queueMessage);
+            log.info("[Success] Message sent to queue successfully.");
 
         } catch (Exception e) {
-            context.getLogger().severe("Error: " + e.getMessage());
-            return request.createResponseBuilder(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body("Error processing file: " + e.getMessage())
-                    .build();
-        }
-    }
-
-    private long countLines(String filePath) throws Exception {
-        try (BufferedReader reader = new BufferedReader(
-                new java.io.InputStreamReader(new java.io.FileInputStream(filePath), StandardCharsets.UTF_8))) {
-            return reader.lines().count();
+            log.severe("[Error] Failed to process blob: " + e.getMessage());
         }
     }
 }
